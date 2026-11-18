@@ -56,6 +56,10 @@
       "command": "python3 examples/walkthrough.py --workflow vacuum"
     },
     {
+      "workflow_id": "retention-window",
+      "command": "python3 examples/walkthrough.py --workflow retention-window"
+    },
+    {
       "workflow_id": "transaction-close",
       "command": "python3 examples/walkthrough.py --workflow transaction-close"
     },

@@ -16,12 +16,33 @@ func (s *Server) checkpoint(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) vacuum(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Horizon uint64 `json:"horizon"`
+		Horizon *uint64 `json:"horizon"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	out, err := s.db.Vacuum(in.Horizon)
+	out, status, err := s.db.Vacuum(in.Horizon)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, 200, map[string]any{"vacuum": out, "retention": status})
+}
+func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		out, err := s.db.RetentionStatus()
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		write(w, 200, out)
+		return
+	}
+	var in engine.RetentionRequest
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.db.SetRetention(in)
 	if err != nil {
 		respondError(w, err)
 		return

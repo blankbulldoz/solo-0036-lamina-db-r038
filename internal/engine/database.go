@@ -10,22 +10,31 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type DB struct {
-	mu           sync.RWMutex
-	dir          string
-	catalog      *catalog.Catalog
-	store        *versions.Store
-	indexes      *index.Registry
-	wal          *journal.WAL
-	sequence     uint64
-	horizon      uint64
+	mu       sync.RWMutex
+	dir      string
+	catalog  *catalog.Catalog
+	store    *versions.Store
+	indexes  *index.Registry
+	wal      *journal.WAL
+	sequence uint64
+	horizon  uint64
+	// retainFrom is the logical admission boundary (the traceability promise).
+	// horizon is the physical reclamation boundary and may lag retainFrom
+	// while long-lived transactions hold older snapshots.
+	retainFrom   uint64
+	policy       journal.RetentionPolicy
 	transactions map[string]*Transaction
 	closed       bool
 	commits      uint64
 	conflicts    uint64
 	queries      uint64
+	// purgedVersions accumulates versions physically removed since open, so a
+	// restart-era session can still reconcile every reclaim it observed.
+	purgedVersions int
 }
 
 func Open(dir string) (*DB, error) {
@@ -47,12 +56,18 @@ func Open(dir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
+	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}, policy: journal.RetentionPolicy{Mode: "sequence", Horizon: 0}}
 	if !missing {
 		d.catalog = image.Catalog
 		d.store = image.Store
 		d.sequence = image.Sequence
 		d.horizon = image.Horizon
+		d.retainFrom = image.RetainFrom
+		if image.Policy != nil {
+			d.policy = *image.Policy
+		} else {
+			d.policy = journal.RetentionPolicy{Mode: "sequence", Horizon: image.RetainFrom}
+		}
 	}
 	last := w.Base + uint64(len(w.Records))
 	if d.sequence > last {
@@ -66,6 +81,15 @@ func Open(dir string) (*DB, error) {
 		if err = d.apply(r); err != nil {
 			w.Close()
 			return nil, fmt.Errorf("replay sequence %d: %w", r.Sequence, err)
+		}
+	}
+	// A duration window is evaluated against wall-clock time at every open:
+	// the promise is monotonic in sequence space, so re-resolving can only
+	// confirm the boundary or advance it, never restart it.
+	if d.policy.Mode == "duration" {
+		resolved := d.resolveLogical(d.policy, time.Now().UTC())
+		if resolved > d.retainFrom {
+			d.retainFrom = resolved
 		}
 	}
 	d.indexes = index.Build(d.catalog, d.store)
@@ -99,6 +123,11 @@ func (d *DB) Close() error {
 func (d *DB) publish(r journal.Record) error {
 	r.Sequence = d.sequence + 1
 	r.Format = 1
+	// Stamp once at publication. Replay keeps the recorded instant instead of
+	// re-stamping, so duration windows remain anchored across restarts.
+	if r.CommitTime == "" {
+		r.CommitTime = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	if err := d.wal.Append(r); err != nil {
 		return fault("unavailable", "durable commit failed: %s", err)
 	}

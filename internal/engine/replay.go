@@ -58,8 +58,46 @@ func (d *DB) apply(r journal.Record) error {
 		if r.Horizon < d.horizon || r.Horizon > d.sequence {
 			return fmt.Errorf("invalid vacuum horizon")
 		}
+		// Vacuum records written before the retention split carry no logical
+		// boundary; their physical horizon was itself the promise.
+		logical := r.LogicalHorizon
+		if logical == 0 {
+			logical = r.Horizon
+		}
+		if logical < r.Horizon {
+			return fmt.Errorf("vacuum logical horizon below physical horizon")
+		}
 		d.store.Vacuum(r.Horizon)
 		d.horizon = r.Horizon
+		if logical > d.retainFrom {
+			d.retainFrom = logical
+		}
+		if r.Removed > 0 {
+			d.purgedVersions += r.Removed
+		}
+	case "retention":
+		if r.Policy == nil {
+			return fmt.Errorf("invalid retention record")
+		}
+		switch r.Policy.Mode {
+		case "sequence":
+			// A clamped pressure request can record a horizon below the
+			// effective boundary; the boundary itself must still be monotonic.
+			if r.Policy.Horizon > r.LogicalHorizon {
+				return fmt.Errorf("retention policy horizon exceeds effective boundary")
+			}
+		case "duration":
+			if r.Policy.DurationNS <= 0 {
+				return fmt.Errorf("invalid retention duration")
+			}
+		default:
+			return fmt.Errorf("invalid retention policy mode")
+		}
+		if r.LogicalHorizon < d.retainFrom {
+			return fmt.Errorf("retention boundary moved backwards")
+		}
+		d.policy = *r.Policy
+		d.retainFrom = r.LogicalHorizon
 	default:
 		return fmt.Errorf("unknown record kind %s", r.Kind)
 	}

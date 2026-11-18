@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','retention-window','transaction-close','statistics']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -38,6 +38,9 @@ class Session:
  def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
  def stats(self):return self.call('GET','/stats')
+ def retention(self):return self.call('GET','/retention')
+ def set_retention(self,body,status=200):return self.call('POST','/retention',body,status)
+ def vacuum(self,body=None,status=200):return self.call('POST','/vacuum',body or {},status)
 def require(condition,message):
  if not condition:raise RuntimeError(message)
 def tuple_(n,band=None,amplitude=None):return {'sample':n,'band':band or f'b{n}','amplitude':n*10 if amplitude is None else amplitude,'valid':True}
@@ -137,12 +140,72 @@ def walkthrough(name,binary):
     require(len(page['records'])==1 and len(page['records'][0]['writes'])==4 and page['cursor']==committed['sequence'],'change page split transaction')
     s.call('GET','/changes?after=999',status=400);observations=page
    elif name=='vacuum':
-    old=s.begin();tx=s.begin();s.put(tx,tuple_(1,amplitude=99));s.commit(tx);requested=s.stats()['sequence']
-    pinned=s.call('POST','/vacuum',{'horizon':requested});require(pinned['pinned'] and pinned['horizon']==seed_seq,'vacuum crossed active snapshot')
-    require(s.query(transaction=old)['rows'][0]['amplitude']==10,'active snapshot lost')
-    s.call('POST',f'/transactions/{old}/rollback');reclaimed=s.call('POST','/vacuum',{'horizon':requested})
-    require(reclaimed['removed']>=1,'obsolete version not reclaimed');s.call('POST','/query',{'relation':'spectra','at':seed_seq},410)
-    s.call('POST','/checkpoint');s.stop();s.start();require(s.query()['rows'][0]['amplitude']==99,'vacuum did not survive restart');observations={'pinned':pinned,'reclaimed':reclaimed}
+    initial=s.retention();require(initial['window_start']==0 and initial['physical_horizon']==0 and initial['retention_policy']['mode']=='sequence','default retention not observable')
+    old=s.begin();tx=s.begin();s.put(tx,tuple_(1,amplitude=99));committed=s.commit(tx);requested=s.stats()['sequence']
+    # The window is a logical admission boundary: declaring it must not remove
+    # anything on its own, and active transactions keep their snapshots valid.
+    declared=s.set_retention({'mode':'sequence','horizon':requested});require(declared['window_start']==requested and declared['purged_versions_since_open']==0,'policy change physically removed versions')
+    require(s.query(transaction=old)['rows'][0]['amplitude']==10,'active snapshot lost after window change')
+    # Rejected admission explains the distinction between logical expiry and
+    # physical purging: the old sequence is inadmissible while still retained.
+    logical_err=s.call('POST','/query',{'relation':'spectra','at':seed_seq},410)
+    require('outside the declared retention window' in logical_err['error']['message'],'logical rejection not explained')
+    # Physical reclamation can only follow the lowest active pin, and says so.
+    pinned=s.vacuum();pin=pinned['vacuum'];status=pinned['retention']
+    require(pin['pinned'] and pin['horizon']==seed_seq and status['physical_horizon']==seed_seq,'vacuum crossed active snapshot')
+    require(status['window_start']==requested and status['pinned_horizon']==seed_seq and len(status['pins'])>=1,'pin explanation missing')
+    require(status['expired_versions']>=1 and status['expired_but_retained']>=1 and status['removable_now']==0 and status['purged_versions_since_open']==0,'expired/purged accounting conflated')
+    s.call('POST',f'/transactions/{old}/rollback')
+    reclaimed=s.vacuum();v=reclaimed['vacuum'];after=reclaimed['retention']
+    require(v['removed']>=1 and not v['pinned'] and after['physical_horizon']==requested,'obsolete version not reclaimed')
+    require(after['purged_versions_since_open']==v['removed'] and after['removable_now']==0,'reclaim accounting inconsistent')
+    purged_err=s.call('POST','/query',{'relation':'spectra','at':seed_seq},410)
+    require('physically purged' in purged_err['error']['message'],'physical purge not distinguished')
+    require(s.query()['rows'][0]['amplitude']==99,'current read broken after vacuum')
+    # Water marks are durable facts, not session config: restart reconciles them.
+    s.call('POST','/checkpoint');s.stop();s.start()
+    revived=s.retention();require(revived['window_start']==requested and revived['physical_horizon']==requested and revived['retention_policy']['mode']=='sequence','water marks lost on restart')
+    require(s.query()['rows'][0]['amplitude']==99,'vacuum did not survive restart')
+    s.call('POST','/query',{'relation':'spectra','at':seed_seq},410)
+    # The physical horizon can never move backwards, even with an explicit request.
+    s.call('POST','/vacuum',{'horizon':seed_seq},400)
+    observations={'declared':declared,'pinned':pin,'reclaimed':v,'after_restart':revived,'committed_at':committed['sequence']}
+   elif name=='retention-window':
+    # A time-based window maps onto sequence space via durable commit
+    # timestamps; sequence counts are never used as a proxy for elapsed time.
+    hour=3600*10**9
+    first=s.set_retention({'mode':'duration','duration_ns':hour})
+    head0=s.stats()['sequence']
+    require(first['window_start']<=head0 and first['window_end']==head0 and first['retention_policy']['mode']=='duration' and first['cutoff_time'],'fresh duration window must keep every existing commit')
+    anchor=s.stats()['sequence'];tx=s.begin();s.put(tx,tuple_(1,amplitude=99));s.commit(tx)
+    # An idle period advances wall-clock time without adding commits: the
+    # window still must not jump over the only committed sequence.
+    time.sleep(1.05);idle=s.retention()
+    require(idle['window_start']==first['window_start'] and idle['anchor_sequence']==first['anchor_sequence'],'idle time was interpreted as sequence progress')
+    require(s.query(at=anchor)['rows'][0]['amplitude']==10,'recent snapshot lost in duration window')
+    # A commit immediately before the window change guarantees the 1ns window
+    # advances the boundary to the head, so the later clamp is deterministic.
+    fresh=s.begin();s.put(fresh,tuple_(2,amplitude=77));s.commit(fresh)
+    narrowed=s.set_retention({'mode':'duration','duration_ns':1})
+    head=s.stats()['sequence']
+    require(narrowed['window_start']>=head-1 and narrowed['cutoff_time'],'short window did not derive an anchor')
+    # A pressure relaxation that would move the boundary backwards is clamped
+    # to the current boundary and reported rather than silently applied.
+    relaxed_horizon=max(0,narrowed['window_start']-1)
+    widened=s.set_retention({'mode':'sequence','horizon':relaxed_horizon})
+    require(widened['window_start']==narrowed['window_start'],'window moved backwards under pressure relaxation')
+    require(widened['adjusted'] and 'clamped' in widened['reason'],'clamp outcome unexplained')
+    # Invalid policy shapes are rejected before consuming a journal sequence.
+    before=s.stats()['sequence'];s.set_retention({'mode':'duration','duration_ns':0},400);s.set_retention({'mode':'sequence','horizon':before+100},400);s.set_retention({'mode':'wallclock'},400)
+    require(s.stats()['sequence']==before,'invalid retention consumed a sequence')
+    # Restart re-anchors against stored commit times rather than restarting the
+    # count, and the old query remains rejected by the same boundary.
+    s.call('POST','/checkpoint');s.stop();s.start()
+    revived=s.retention();require(revived['retention_policy']['mode']=='sequence' and revived['window_start']==narrowed['window_start'],'retention boundary restarted from zero after restart')
+    require(revived['physical_horizon']<=revived['window_start'],'physical horizon passed the logical window')
+    s.call('POST','/query',{'relation':'spectra','at':0},410)
+    reclaimed=s.vacuum();require(reclaimed['retention']['physical_horizon']>=revived['window_start'] or reclaimed['vacuum']['pinned'],'vacuum did not honour the duration window')
+    observations={'idle':idle,'narrowed':narrowed,'widened':widened,'after_restart':revived,'reclaimed':reclaimed}
    elif name=='transaction-close':
     tx=s.begin();s.put(tx,tuple_(8));s.call('POST',f'/transactions/{tx}/rollback');s.commit(tx,404)
     require(s.query()['matched']==7 and not s.stats()['active'],'rollback leaked state or pin')

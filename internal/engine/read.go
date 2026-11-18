@@ -29,8 +29,17 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 	} else if q.At != nil {
 		at = *q.At
 	}
-	if at < d.horizon || at > d.sequence {
-		return query.Result{}, fault("snapshot", "snapshot unavailable; retained interval %d..%d", d.horizon, d.sequence)
+	if at > d.sequence {
+		return query.Result{}, fault("snapshot", "snapshot %d does not exist yet; head sequence is %d", at, d.sequence)
+	}
+	// A still-active transaction holds its snapshot regardless of any later
+	// retention change; it also pins physical reclamation, so its reads can
+	// never encounter an already-removed version.
+	if tx == nil && at < d.retainFrom {
+		if at < d.horizon {
+			return query.Result{}, fault("snapshot", "snapshot %d was physically purged at horizon %d; retained interval %d..%d", at, d.horizon, d.retainFrom, d.sequence)
+		}
+		return query.Result{}, fault("snapshot", "snapshot %d is outside the declared retention window %d..%d; the versions are logically inadmissible though still retained until vacuum", at, d.retainFrom, d.sequence)
 	}
 	if at < r.Created {
 		return query.Result{}, fault("snapshot", "relation did not exist at snapshot")

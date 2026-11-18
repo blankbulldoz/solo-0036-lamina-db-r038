@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"lamina/internal/index"
 	"lamina/internal/journal"
 	"lamina/internal/snapshot"
 	"lamina/internal/versions"
@@ -11,7 +10,8 @@ import (
 )
 
 func (d *DB) image() snapshot.Image {
-	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Clone()}
+	policy := d.policy
+	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, RetainFrom: d.retainFrom, Policy: &policy, Catalog: d.catalog.Clone(), Store: d.store.Clone()}
 }
 func (d *DB) Checkpoint() (uint64, error) {
 	d.mu.Lock()
@@ -70,27 +70,16 @@ func Restore(dir string, data []byte) error {
 	installed = true
 	return nil
 }
-func (d *DB) Vacuum(requested uint64) (versions.VacuumResult, error) {
+
+// Vacuum runs physical reclamation within the declared retention window. The
+// request horizon is optional; when present it may only narrow the current
+// window and must not move the physical boundary backwards. Active
+// transactions pin the physical horizon without changing the logical promise.
+func (d *DB) Vacuum(requested *uint64) (versions.VacuumResult, RetentionStatus, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
-		return versions.VacuumResult{}, err
+		return versions.VacuumResult{}, RetentionStatus{}, err
 	}
-	if requested > d.sequence || requested < d.horizon {
-		return versions.VacuumResult{}, fault("invalid", "vacuum horizon outside retained interval")
-	}
-	horizon := requested
-	for _, tx := range d.transactions {
-		if tx.Snapshot < horizon {
-			horizon = tx.Snapshot
-		}
-	}
-	beforeKeys, beforeVersions := d.store.Count()
-	_ = beforeKeys
-	if err := d.publish(journal.Record{Kind: "vacuum", Horizon: horizon}); err != nil {
-		return versions.VacuumResult{}, err
-	}
-	_, remaining := d.store.Count()
-	d.indexes = index.Build(d.catalog, d.store)
-	return versions.VacuumResult{Horizon: horizon, Removed: beforeVersions - remaining, Retained: remaining, Pinned: horizon < requested}, nil
+	return d.enforceVacuum(requested)
 }

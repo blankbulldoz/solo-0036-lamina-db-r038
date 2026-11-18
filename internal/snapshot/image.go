@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"lamina/internal/catalog"
+	"lamina/internal/journal"
 	"lamina/internal/versions"
 	"os"
 )
@@ -14,11 +15,17 @@ import (
 const MaxImage = 128 << 20
 
 type Image struct {
-	Format   int              `json:"format"`
-	Sequence uint64           `json:"sequence"`
-	Horizon  uint64           `json:"horizon"`
-	Catalog  *catalog.Catalog `json:"catalog"`
-	Store    *versions.Store  `json:"store"`
+	Format   int    `json:"format"`
+	Sequence uint64 `json:"sequence"`
+	Horizon  uint64 `json:"horizon"`
+	// RetainFrom is the logical admission boundary; Horizon is the physical
+	// reclamation boundary. RetainFrom always leads Horizon and never moves
+	// backwards, so the promise and its physical fulfilment stay separately
+	// auditable after a restart.
+	RetainFrom uint64                   `json:"retain_from"`
+	Policy     *journal.RetentionPolicy `json:"policy,omitempty"`
+	Catalog    *catalog.Catalog         `json:"catalog"`
+	Store      *versions.Store          `json:"store"`
 }
 type Envelope struct {
 	Format  int             `json:"format"`
@@ -51,6 +58,12 @@ func Decode(b []byte) (Image, error) {
 	if err := json.Unmarshal(env.Payload, &image); err != nil {
 		return image, err
 	}
+	// Images written before the retention split carry no logical boundary or
+	// policy; the physical horizon was itself the promise, so derive the same
+	// meaning instead of rejecting the older on-disk format.
+	if image.Policy == nil && image.RetainFrom == 0 {
+		image.RetainFrom = image.Horizon
+	}
 	if err := Validate(image); err != nil {
 		return image, err
 	}
@@ -69,8 +82,22 @@ func Read(path string) (Image, error) {
 	return Decode(b)
 }
 func Validate(image Image) error {
-	if image.Format != 1 || image.Horizon > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {
+	if image.Format != 1 || image.Horizon > image.Sequence || image.RetainFrom < image.Horizon || image.RetainFrom > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {
 		return fmt.Errorf("invalid image header")
+	}
+	if image.Policy != nil {
+		switch image.Policy.Mode {
+		case "sequence":
+			if image.Policy.Horizon > image.RetainFrom {
+				return fmt.Errorf("policy horizon exceeds image retain_from")
+			}
+		case "duration":
+			if image.Policy.DurationNS <= 0 {
+				return fmt.Errorf("invalid duration policy")
+			}
+		default:
+			return fmt.Errorf("invalid retention policy mode")
+		}
 	}
 	for name, r := range image.Catalog.Relations {
 		if name != r.Name || r.Created == 0 || r.Created > image.Sequence {
